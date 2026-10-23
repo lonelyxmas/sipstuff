@@ -1,0 +1,10 @@
+*
+!dist_scripts/install_pjsip.sh
+!requirements.txt
+!README.md
+!pyproject.toml
+!sipstuff
+!sipstuff/**
+**/__pycache__
+**/*.local
+**/*.local.*

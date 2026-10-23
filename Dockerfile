@@ -1,10 +1,12 @@
 ARG python_version=3.14
 ARG debian_version=slim-trixie
+ARG pjsip_version=2.17
+ARG portaudio_ref=1ca0eeedb678c3cca80f3306c474d69a7a4b5278
 
 # ─── Stage 1: Build PJSIP with Python bindings ─────────────────────────────
 FROM python:${python_version}-${debian_version} AS pjsip-builder
 
-ARG pjsip_version=2.16
+ARG pjsip_version
 
 RUN apt update && \
     apt -y install build-essential python3-dev swig \
@@ -30,7 +32,25 @@ shutil.copy2(_pjsua2.__file__, dst);\
 print('Staged libs:', os.listdir('/pjsip-libs'));\
 print('Staged python:', os.listdir(dst))"
 
-# ─── Stage 2: Main image ───────────────────────────────────────────────────
+# ─── Stage 2: Build PortAudio from source with PulseAudio support (Debian's libportaudio2 is ALSA-only) ───
+FROM python:${python_version}-${debian_version} AS portaudio-builder
+
+ARG portaudio_ref
+
+RUN apt-get update && \
+    apt-get -y install --no-install-recommends build-essential cmake git ca-certificates libasound2-dev libpulse-dev && \
+    rm -rf /var/lib/apt/lists/*
+
+# PulseAudio host API is not in any release tag yet (newest: v19.7.0), so pin a commit
+RUN git init -q /tmp/portaudio && \
+    cd /tmp/portaudio && \
+    git fetch -q --depth 1 https://github.com/PortAudio/portaudio.git "${portaudio_ref}" && \
+    git checkout -q FETCH_HEAD && \
+    cmake -B build -DCMAKE_INSTALL_PREFIX=/usr -DPA_USE_PULSEAUDIO=ON -DPA_USE_ALSA=ON && \
+    cmake --build build -j$(nproc) && \
+    DESTDIR=/portaudio_install cmake --install build
+
+# ─── Stage 3: Main image ───────────────────────────────────────────────────
 FROM python:${python_version}-${debian_version}
 
 # repeat without defaults in this build-stage
@@ -47,18 +67,8 @@ RUN apt update && \
     pip install --upgrade pip && \
     rm -rf /var/lib/apt/lists/*
 
-# Build PortAudio from source with PulseAudio support (Debian's libportaudio2 is ALSA-only)
-RUN apt update && \
-    apt -y install --no-install-recommends build-essential cmake git libasound2-dev libpulse-dev && \
-    git clone --depth 1 https://github.com/PortAudio/portaudio.git /tmp/portaudio && \
-    cd /tmp/portaudio && \
-    cmake -B build -DCMAKE_INSTALL_PREFIX=/usr -DPA_USE_PULSEAUDIO=ON -DPA_USE_ALSA=ON && \
-    cmake --build build -j$(nproc) && \
-    cmake --install build && \
-    ldconfig && \
-    rm -rf /tmp/portaudio && \
-    apt -y purge --auto-remove build-essential cmake git libasound2-dev libpulse-dev && \
-    rm -rf /var/lib/apt/lists/*
+COPY --from=portaudio-builder /portaudio_install/ /
+RUN ldconfig
 
 RUN sed -i -e 's/# de_DE.UTF-8 UTF-8/de_DE.UTF-8 UTF-8/' /etc/locale.gen && \
     locale-gen && \

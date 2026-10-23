@@ -6,10 +6,19 @@ set -euo pipefail
 #=============================================================================
 readonly SCRIPT_DIR="$(dirname "$(realpath "$0")")"
 readonly INCLUDE_SH="include.sh"
+# Directory or config.json path; takes precedence over the docker-config auto-detection; made readonly after sourcing include.sh
+DOCKER_CONFIG_OVERRIDE="${DOCKER_CONFIG_OVERRIDE:-}"
 readonly PODMAN_VM_INIT_DISK_SIZE=100
 readonly PYTHON_VERSION=3.14
 readonly DEBIAN_VERSION=slim-trixie
-readonly PJSIP_VERSION=$(curl -s https://api.github.com/repos/pjsip/pjproject/releases/latest | jq -r '.tag_name')  # 2.16
+# PJSIP_VERSION env var overrides auto-detection of the newest X.Y[.Z] tag
+# (git ls-remote: no GitHub API rate limit, proper version sort)
+pjsip_version="${PJSIP_VERSION:-$(git ls-remote --tags --refs --sort=-v:refname https://github.com/pjsip/pjproject.git '[0-9]*' | sed -n '1s|.*refs/tags/||p')}"
+if [[ ! "${pjsip_version}" =~ ^[0-9]+\.[0-9]+(\.[0-9]+)?$ ]]; then
+  echo "ERROR: could not determine pjsip version (got '${pjsip_version}')" >&2
+  exit 1
+fi
+readonly PJSIP_VERSION=${pjsip_version}
 
 readonly INSTALL_CUDA="${INSTALL_CUDA:-false}"
 readonly INSTALL_OPENVINO="${INSTALL_OPENVINO:-false}"
@@ -55,12 +64,16 @@ readonly BUILD_BASE_ARGS=(
   "--build-arg" "install_openvino=${INSTALL_OPENVINO}"
   )
 
+# Podman-only: make sure the Dockerfile-specific ignore file is also used for remote builds.
+# Docker buildx picks up <Dockerfile>.dockerignore automatically and has no --ignorefile flag.
+readonly PODMAN_EXTRA_ARGS=("--ignorefile" "${DOCKERFILE}.dockerignore")
+
 # podman machine ssh df -h
 # podman --connection podman-machine-default system prune -a
 # podman --connection podman-machine-default system df
 # podman machine inspect podman-machine-default | grep -i disk
 
-readonly BUILD_SCRIPT_VERSION="2026-02-23_11:11:11"
+readonly BUILD_SCRIPT_VERSION="2026-10-23_10:42:59"
 
 # Runtime state
 PODMAN_VM_STARTED=0
@@ -104,12 +117,25 @@ setup_environment() {
     source "${INCLUDE_SH}"
   fi
 
-  DOCKER_CONFIG="$(realpath docker-config)"
-  if ! [ -e  "${DOCKER_CONFIG}" ] ; then
-    DOCKER_CONFIG="$(realpath ../docker-config)"
-  fi
-  if ! [ -e  "${DOCKER_CONFIG}" ] ; then
-    DOCKER_CONFIG="${HOME}/.docker"
+  # Lock DOCKER_CONFIG_OVERRIDE after include.sh (and include.local.sh) had a chance to set it
+  readonly DOCKER_CONFIG_OVERRIDE
+
+  if [[ -n "${DOCKER_CONFIG_OVERRIDE}" ]]; then
+    [[ -e "${DOCKER_CONFIG_OVERRIDE}" ]] || die "DOCKER_CONFIG_OVERRIDE='${DOCKER_CONFIG_OVERRIDE}' does not exist"
+    if [[ -d "${DOCKER_CONFIG_OVERRIDE}" ]]; then
+      DOCKER_CONFIG="$(realpath "${DOCKER_CONFIG_OVERRIDE}")"
+    else
+      DOCKER_CONFIG="$(dirname "$(realpath "${DOCKER_CONFIG_OVERRIDE}")")"
+    fi
+    log "DOCKER_CONFIG override active: ${DOCKER_CONFIG}"
+  else
+    DOCKER_CONFIG="$(realpath docker-config)"
+    if ! [ -e  "${DOCKER_CONFIG}" ] ; then
+      DOCKER_CONFIG="$(realpath ../docker-config)"
+    fi
+    if ! [ -e  "${DOCKER_CONFIG}" ] ; then
+      DOCKER_CONFIG="${HOME}/.docker"
+    fi
   fi
 
   export DOCKER_CONFIG
@@ -209,20 +235,11 @@ copy_image_from_remote() {
   local image="$2"
   log "Copying image from ${connection} to host: ${image}"
 
-  # Transfer via `podman image save | podman image load` instead of
-  # `podman image scp`. scp shells out to the podman binary over SSH on the
-  # remote and is brittle (needs a matching remote podman in $PATH, no
-  # progress, silent failures); a streamed save->load only needs the podman
-  # socket connection we already validated.
-  #
-  # Drop any stale local copy first so the pipeline doesn't keep dangling
-  # layers around. `podman load` normalizes a short-name RepoTag to
-  # localhost/..., so clean all three possible forms.
+  # podman image scp needs a matching podman binary in the remote $PATH; save|load only needs the socket
   podman image rm "${image}" 2>/dev/null || true
   podman image rm "docker.io/${image}" 2>/dev/null || true
   podman image rm "localhost/${image}" 2>/dev/null || true
 
-  # Image size (from the remote store) feeds pv's -s so it can show percent + ETA.
   local size
   size=$(podman --connection "${connection}" image inspect \
           --format '{{.Size}}' "${image}" 2>/dev/null || echo "")
@@ -247,8 +264,7 @@ copy_image_from_remote() {
       || die "streamed image transfer of ${image} failed"
   fi
 
-  # `podman load` strips the registry component and re-normalizes a short name
-  # to localhost/...; retag so the reference the manifest step uses resolves.
+  # podman load re-normalizes the RepoTag to localhost/...
   if podman image exists "localhost/${image}"; then
     podman tag "localhost/${image}" "${image}"
   fi
@@ -312,8 +328,7 @@ build_with_podman() {
     ensure_remote_arm64_connection
   fi
 
-  # Add latest tag if not already latest
-  local -a build_args=("${BUILD_BASE_ARGS[@]}")
+  local -a build_args=("${BUILD_BASE_ARGS[@]}" "${PODMAN_EXTRA_ARGS[@]}")
 
   # Build for each platform (in parallel)
   for platform in "${PLATFORMS[@]}"; do
@@ -457,6 +472,9 @@ build_local_only() {
   local native_platform="linux/${native_arch}"
 
   local -a build_args=("${BUILD_BASE_ARGS[@]}")
+  if (( DOCKER_IS_PODMAN == 1 )); then
+    build_args+=("${PODMAN_EXTRA_ARGS[@]}")
+  fi
   build_args+=("--platform" "${native_platform}")
   if [[ -n "${DOCKER_IMAGE_LATEST}" && "${DOCKER_IMAGE}" != *:latest ]]; then
     build_args+=("-t" "${DOCKER_IMAGE_LATEST}")
