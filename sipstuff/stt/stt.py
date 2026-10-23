@@ -22,8 +22,11 @@ import threading
 from pathlib import Path
 from typing import Any
 
+import numpy as np
+import numpy.typing as npt
 from loguru import logger
 
+from sipstuff.audio import resample_linear
 from sipstuff.sipconfig import SttConfig
 
 try:
@@ -225,7 +228,9 @@ def transcribe_wav(
     )
 
     try:
-        segments_iter, info = loaded_model.transcribe(str(wav_path), language=language, vad_filter=vad_filter)
+        # faster-whisper's own file decoding calls av.open(metadata_errors=...), which PyAV >= 19 rejects
+        audio = _load_audio_16k_mono(wav_path)
+        segments_iter, info = loaded_model.transcribe(audio, language=language, vad_filter=vad_filter)
         segment_list = []
         for segment in segments_iter:
             stripped = segment.text.strip()
@@ -246,6 +251,13 @@ def transcribe_wav(
         "segments": segment_list,
     }
     return text, stt_meta
+
+
+def _load_audio_16k_mono(wav_path: Path) -> npt.NDArray[np.float32]:
+    import soundfile as sf
+
+    data, rate = sf.read(str(wav_path), dtype="float32", always_2d=True)
+    return resample_linear(data.mean(axis=1), rate, 16000)
 
 
 def _load_stt_model_uncached(cfg: SttConfig) -> Any:
